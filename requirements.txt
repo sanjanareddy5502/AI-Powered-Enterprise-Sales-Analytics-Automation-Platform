@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+scikit-learn
+prophet
+sentence-transformers
+openai
+openpyxl
