@@ -58,6 +58,35 @@ SEMANTIC_SCHEMA = {
     ],
     "profit": [
         "profit", "margin", "net profit", "gross profit"
+    ],
+    # QuickBooks / accounting report fields
+    "vendor_name": [
+        "vendor", "vendor name", "payee", "name", "merchant",
+        "supplier", "company name"
+    ],
+    "transaction_type": [
+        "type", "transaction type", "txn type", "transaction category"
+    ],
+    "transaction_number": [
+        "num", "number", "transaction number", "check number", "ref number"
+    ],
+    "memo": [
+        "memo", "description", "note", "transaction memo"
+    ],
+    "account": [
+        "account", "account name", "bank account", "ledger account"
+    ],
+    "cleared_status": [
+        "clr", "cleared", "cleared status", "reconciled"
+    ],
+    "debit": [
+        "debit", "withdrawal", "money out", "expense", "charge"
+    ],
+    "credit": [
+        "credit", "deposit", "money in", "income", "payment"
+    ],
+    "split": [
+        "split", "category split", "account split", "distribution"
     ]
 }
 
@@ -165,6 +194,10 @@ def detect_dataset_type(df):
     has_user = any(word in all_cols for word in ["user", "visitor", "session"])
     has_inventory = any(word in all_cols for word in ["stock", "inventory", "warehouse", "quantity"])
     has_finance = any(word in all_cols for word in ["expense", "cost", "budget", "profit", "loss"])
+    has_quickbooks = any(word in all_cols for word in ["debit", "credit", "clr", "split", "memo", "vendor"])
+
+    if has_quickbooks:
+        return "QuickBooks / Financial Transaction Dataset"
 
     if has_sales and has_date:
         return "Sales Dataset"
@@ -309,6 +342,62 @@ def universal_data_cleaning(df):
     )
 
     return df, cleaning_report
+
+
+def apply_quickbooks_mapping(df, semantic_mapping):
+    """
+    QuickBooks reports often contain useful unnamed columns.
+    This function prevents the AI mapper from mislabeling accounting fields.
+    """
+    quickbooks_manual_mapping = {
+        "unknown_column_1": "vendor_name",
+        "name": "vendor_name",
+        "vendor": "vendor_name",
+        "type": "transaction_type",
+        "date": "order_date",
+        "num": "transaction_number",
+        "memo": "memo",
+        "account": "account",
+        "clr": "cleared_status",
+        "split": "split",
+        "debit": "debit",
+        "credit": "credit"
+    }
+
+    fixed_mapping = dict(semantic_mapping)
+
+    for original_col, target_col in quickbooks_manual_mapping.items():
+        if original_col in df.columns:
+            fixed_mapping[original_col] = target_col
+
+    return fixed_mapping
+
+
+def create_financial_value_column(df):
+    """
+    Creates one analysis value column from sales/debit/credit fields.
+    This keeps the rest of the dashboard working for QuickBooks files.
+    """
+    if "sales" in df.columns:
+        df["sales"] = pd.to_numeric(df["sales"], errors="coerce").fillna(0)
+        return df
+
+    if "debit" in df.columns:
+        df["debit"] = pd.to_numeric(df["debit"], errors="coerce").fillna(0)
+
+    if "credit" in df.columns:
+        df["credit"] = pd.to_numeric(df["credit"], errors="coerce").fillna(0)
+
+    if "debit" in df.columns and "credit" in df.columns:
+        # Absolute transaction value for BI charts/anomaly detection.
+        df["sales"] = df["debit"].abs() + df["credit"].abs()
+    elif "debit" in df.columns:
+        df["sales"] = df["debit"].abs()
+    elif "credit" in df.columns:
+        df["sales"] = df["credit"].abs()
+
+    return df
+
 st.title("AI-Powered Universal Business Intelligence Platform")
 
 st.write(
@@ -387,50 +476,89 @@ def run_ecommerce_behavior_engine(df):
 
         st.dataframe(top_users)
 if uploaded_file is not None:
+
+    # Load file
     df = load_file(uploaded_file)
 
+    # Detect dataset type
     dataset_type = detect_dataset_type(df)
 
     st.subheader("Detected Dataset Type")
     st.info(dataset_type)
 
+    # Universal cleaning
     df, cleaning_report = universal_data_cleaning(df)
 
-st.subheader("Data Cleaning Summary")
-st.json(cleaning_report)
+    st.subheader("Data Cleaning Summary")
+    st.json(cleaning_report)
 
-semantic_mapping, detection_report = semantic_column_mapper(df)
+    # Semantic schema detection
+    semantic_mapping, detection_report = semantic_column_mapper(df)
 
-st.subheader("Detected Semantic Schema")
-st.json(semantic_mapping)
+    # QuickBooks/accounting reports need manual correction because useful columns
+    # can be unnamed and fields like Type, Split, Debit, Credit are accounting-specific.
+    semantic_mapping = apply_quickbooks_mapping(df, semantic_mapping)
 
-with st.expander("View Schema Detection Confidence"):
-    st.dataframe(pd.DataFrame(detection_report))
+    st.subheader("Detected Semantic Schema")
+    st.json(semantic_mapping)
 
-df = df.rename(columns=semantic_mapping)
+    with st.expander("View Schema Detection Confidence"):
+        st.dataframe(pd.DataFrame(detection_report))
 
-    if dataset_type == "Ecommerce Interaction Dataset":
-        st.success("File uploaded, cleaned, and processed successfully.")
-        st.subheader("Data Preview")
-        st.dataframe(df.head())
+    # Rename columns
+    df = df.rename(columns=semantic_mapping)
 
-        run_ecommerce_behavior_engine(df)
-        st.stop()
+    # Create one common value column so the existing dashboard works for
+    # QuickBooks debit/credit files as well as sales files.
+    df = create_financial_value_column(df)
 
     st.success("File uploaded, cleaned, and processed successfully.")
 
     st.subheader("Data Preview")
     st.dataframe(df.head())
-    if "sales" not in df.columns:
-        st.error("No sales/revenue/amount column detected. Upload a business dataset with a numeric value column.")
+
+    # Ecommerce flow
+    if dataset_type == "Ecommerce Interaction Dataset":
+
+        run_ecommerce_behavior_engine(df)
+
         st.stop()
 
-    total_sales = df["sales"].sum()
-    total_orders = df["order_id"].nunique() if "order_id" in df.columns else len(df)
-    total_customers = df["customer_name"].nunique() if "customer_name" in df.columns else 0
-    total_products = df["product_name"].nunique() if "product_name" in df.columns else 0
+    # Validate value column
+    if "sales" not in df.columns:
 
+        st.error(
+            "No sales/revenue/debit/credit amount column detected. "
+            "Upload a business dataset with at least one usable numeric value column."
+        )
+
+        st.stop()
+
+    # KPI calculations
+    total_sales = df["sales"].sum()
+
+    total_orders = (
+        df["order_id"].nunique()
+        if "order_id" in df.columns
+        else len(df)
+    )
+
+    entity_col = "customer_name" if "customer_name" in df.columns else "vendor_name" if "vendor_name" in df.columns else None
+
+    total_customers = (
+        df[entity_col].nunique()
+        if entity_col else 0
+    )
+
+    total_products = (
+        df["product_name"].nunique()
+        if "product_name" in df.columns
+        else 0
+    )
+
+    # AI Summary
     st.subheader("AI Business Insights Summary")
+
     st.markdown(f"""
     - Total revenue/value detected: **${total_sales:,.0f}**
     - Total records after cleaning: **{df.shape[0]:,}**
@@ -438,34 +566,71 @@ df = df.rename(columns=semantic_mapping)
     - Highest transaction value: **${df['sales'].max():,.2f}**
     """)
 
+    # KPI Dashboard
     st.subheader("Executive KPI Overview")
+
     c1, c2, c3, c4 = st.columns(4)
+
     c1.metric("Total Sales / Value", f"${total_sales:,.0f}")
     c2.metric("Total Orders / Records", f"{total_orders:,}")
-    c3.metric("Total Customers", f"{total_customers:,}")
+    c3.metric("Total Customers / Vendors", f"{total_customers:,}")
     c4.metric("Total Products", f"{total_products:,}")
 
+    # Business dashboards
     st.subheader("Business Performance Dashboards")
 
     col1, col2 = st.columns(2)
 
     with col1:
+
         if "region" in df.columns:
-            regional_sales = df.groupby("region")["sales"].sum().reset_index()
-            fig_region = px.bar(regional_sales, x="region", y="sales", title="Regional Performance")
+
+            regional_sales = (
+                df.groupby("region")["sales"]
+                .sum()
+                .reset_index()
+            )
+
+            fig_region = px.bar(
+                regional_sales,
+                x="region",
+                y="sales",
+                title="Regional Performance"
+            )
+
             st.plotly_chart(fig_region, use_container_width=True)
 
     with col2:
+
         if "category" in df.columns:
-            category_sales = df.groupby("category")["sales"].sum().reset_index()
-            fig_category = px.pie(category_sales, names="category", values="sales", title="Category Performance")
+
+            category_sales = (
+                df.groupby("category")["sales"]
+                .sum()
+                .reset_index()
+            )
+
+            fig_category = px.pie(
+                category_sales,
+                names="category",
+                values="sales",
+                title="Category Performance"
+            )
+
             st.plotly_chart(fig_category, use_container_width=True)
 
+    # Monthly trends
     if "order_date" in df.columns:
+
         st.subheader("Monthly Trend Analysis")
 
         monthly_sales = (
-            df.groupby(pd.Grouper(key="order_date", freq="ME"))["sales"]
+            df.groupby(
+                pd.Grouper(
+                    key="order_date",
+                    freq="ME"
+                )
+            )["sales"]
             .sum()
             .reset_index()
         )
@@ -477,14 +642,23 @@ df = df.rename(columns=semantic_mapping)
             title="Monthly Sales / Value Trend",
             markers=True
         )
+
         st.plotly_chart(fig_monthly, use_container_width=True)
 
+        # Forecasting
         st.subheader("AI Forecasting Engine")
 
-        forecast_data = monthly_sales.rename(columns={"order_date": "ds", "sales": "y"})
+        forecast_data = monthly_sales.rename(
+            columns={
+                "order_date": "ds",
+                "sales": "y"
+            }
+        )
+
         forecast_data = forecast_data.dropna()
 
         if forecast_data.shape[0] >= 12:
+
             forecast_model = Prophet(
                 yearly_seasonality=True,
                 weekly_seasonality=False,
@@ -493,10 +667,16 @@ df = df.rename(columns=semantic_mapping)
 
             forecast_model.fit(forecast_data)
 
-            future_dates = forecast_model.make_future_dataframe(periods=6, freq="ME")
+            future_dates = forecast_model.make_future_dataframe(
+                periods=6,
+                freq="ME"
+            )
+
             forecast_results = forecast_model.predict(future_dates)
 
-            forecast_display = forecast_results[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+            forecast_display = forecast_results[
+                ["ds", "yhat", "yhat_lower", "yhat_upper"]
+            ]
 
             fig_forecast = px.line(
                 forecast_display,
@@ -505,7 +685,11 @@ df = df.rename(columns=semantic_mapping)
                 title="AI-Powered 6-Month Forecast"
             )
 
-            st.plotly_chart(fig_forecast, use_container_width=True)
+            st.plotly_chart(
+                fig_forecast,
+                use_container_width=True
+            )
+
             st.dataframe(forecast_display.tail(6))
 
             st.download_button(
@@ -514,23 +698,55 @@ df = df.rename(columns=semantic_mapping)
                 "forecast_results.csv",
                 "text/csv"
             )
-        else:
-            st.warning("Not enough monthly data for forecasting. At least 12 months are recommended.")
 
+        else:
+
+            st.warning(
+                "Not enough monthly data for forecasting. "
+                "At least 12 months are recommended."
+            )
+
+    # Anomaly detection
     st.subheader("AI-Based Anomaly Detection")
 
+    anomalies = pd.DataFrame()
+
     if df.shape[0] >= 10:
-        anomaly_model = IsolationForest(contamination=0.02, random_state=42)
+
+        anomaly_model = IsolationForest(
+            contamination=0.02,
+            random_state=42
+        )
+
         df["anomaly"] = anomaly_model.fit_predict(df[["sales"]])
-        df["anomaly_label"] = df["anomaly"].map({1: "Normal", -1: "Anomaly"})
+
+        df["anomaly_label"] = df["anomaly"].map({
+            1: "Normal",
+            -1: "Anomaly"
+        })
 
         anomalies = df[df["anomaly_label"] == "Anomaly"]
 
         st.metric("Anomalies Detected", len(anomalies))
 
-        x_axis = "order_date" if "order_date" in df.columns else df.index
+        x_axis = (
+            "order_date"
+            if "order_date" in df.columns
+            else df.index
+        )
 
-        hover_cols = [col for col in ["customer_name", "product_name", "category", "region"] if col in df.columns]
+        hover_cols = [
+            col for col in [
+                "customer_name",
+                "vendor_name",
+                "product_name",
+                "category",
+                "region",
+                "transaction_type",
+                "memo"
+            ]
+            if col in df.columns
+        ]
 
         fig_anomaly = px.scatter(
             df,
@@ -540,24 +756,52 @@ df = df.rename(columns=semantic_mapping)
             hover_data=hover_cols,
             title="AI-Based Anomaly Monitoring"
         )
-        st.plotly_chart(fig_anomaly, use_container_width=True)
+
+        st.plotly_chart(
+            fig_anomaly,
+            use_container_width=True
+        )
+
     else:
-        anomalies = pd.DataFrame()
-        st.warning("Not enough records for anomaly detection.")
 
-    if "customer_name" in df.columns:
-        st.subheader("AI Customer Segmentation")
+        st.warning(
+            "Not enough records for anomaly detection."
+        )
 
-        customer_sales = df.groupby("customer_name")["sales"].sum().reset_index()
+    # Customer/vendor segmentation
+    if entity_col:
+
+        st.subheader("AI Customer / Vendor Segmentation")
+
+        customer_sales = (
+            df.groupby(entity_col)["sales"]
+            .sum()
+            .reset_index()
+        )
 
         if customer_sales.shape[0] >= 3:
+
             scaler = StandardScaler()
-            scaled_sales = scaler.fit_transform(customer_sales[["sales"]])
 
-            kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-            customer_sales["cluster"] = kmeans.fit_predict(scaled_sales)
+            scaled_sales = scaler.fit_transform(
+                customer_sales[["sales"]]
+            )
 
-            cluster_order = customer_sales.groupby("cluster")["sales"].mean().sort_values()
+            kmeans = KMeans(
+                n_clusters=3,
+                random_state=42,
+                n_init=10
+            )
+
+            customer_sales["cluster"] = kmeans.fit_predict(
+                scaled_sales
+            )
+
+            cluster_order = (
+                customer_sales.groupby("cluster")["sales"]
+                .mean()
+                .sort_values()
+            )
 
             segment_mapping = {
                 cluster_order.index[0]: "Low Value",
@@ -565,7 +809,10 @@ df = df.rename(columns=semantic_mapping)
                 cluster_order.index[2]: "High Value"
             }
 
-            customer_sales["segment_label"] = customer_sales["cluster"].map(segment_mapping)
+            customer_sales["segment_label"] = (
+                customer_sales["cluster"]
+                .map(segment_mapping)
+            )
 
             fig_segment = px.pie(
                 customer_sales,
@@ -573,9 +820,17 @@ df = df.rename(columns=semantic_mapping)
                 values="sales",
                 title="Customer Value Segmentation"
             )
-            st.plotly_chart(fig_segment, use_container_width=True)
 
-            st.dataframe(customer_sales.sort_values("sales", ascending=False).head(20))
+            st.plotly_chart(
+                fig_segment,
+                use_container_width=True
+            )
+
+            st.dataframe(
+                customer_sales
+                .sort_values("sales", ascending=False)
+                .head(20)
+            )
 
             st.download_button(
                 "Download Customer Segments",
@@ -583,55 +838,71 @@ df = df.rename(columns=semantic_mapping)
                 "customer_segments.csv",
                 "text/csv"
             )
+
         else:
-            st.warning("Not enough customers for segmentation.")
 
+            st.warning(
+                "Not enough customers for segmentation."
+            )
 
-st.subheader("AI Conversational Analytics Assistant")
+    # AI Assistant
+    st.subheader("AI Conversational Analytics Assistant")
 
+    def generate_ai_answer(df, user_question):
 
-def generate_ai_answer(df, user_question):
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = OpenAI(
+            api_key=st.secrets["OPENAI_API_KEY"]
+        )
 
-    data_summary = {
-        "columns": list(df.columns),
-        "rows": df.shape[0],
-        "sample_rows": df.head(5).to_dict(orient="records"),
-        "numeric_summary": df.describe(include="number").to_dict()
-    }
+        data_summary = {
+            "columns": list(df.columns),
+            "rows": df.shape[0],
+            "sample_rows": df.head(5).to_dict(orient="records"),
+            "numeric_summary": df.describe(include="number").to_dict()
+        }
 
-    prompt = f"""
-    You are an AI business analyst.
-    Use the dataset summary below to answer the user's question.
-    Be direct, practical, and business-focused.
-    Do not invent values that are not supported by the data.
+        prompt = f"""
+        You are an AI business analyst.
+        Use the dataset summary below to answer the user's question.
+        Be direct, practical, and business-focused.
+        Do not invent values that are not supported by the data.
 
-    Dataset Summary:
-    {data_summary}
+        Dataset Summary:
+        {data_summary}
 
-    User Question:
-    {user_question}
-    """
+        User Question:
+        {user_question}
+        """
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=prompt
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt
+        )
+
+        return response.output_text
+
+    user_question = st.text_input(
+        "Ask a business question about this dataset"
     )
 
-    return response.output_text
+    if st.button("Ask AI Analyst"):
 
-user_question = st.text_input("Ask a business question about this dataset")
+        if user_question.strip():
 
-if st.button("Ask AI Analyst"):
-    if user_question.strip():
-        with st.spinner("AI Analyst is thinking..."):
-            answer = generate_ai_answer(df, user_question)
-            st.write(answer)
-    else:
-        st.warning("Please type a question first.")
+            with st.spinner("AI Analyst is thinking..."):
 
+                answer = generate_ai_answer(
+                    df,
+                    user_question
+                )
 
+                st.write(answer)
 
+        else:
+
+            st.warning("Please type a question first.")
+
+    # Downloads
     st.subheader("Download Processed Outputs")
 
     st.download_button(
@@ -642,6 +913,7 @@ if st.button("Ask AI Analyst"):
     )
 
     if not anomalies.empty:
+
         st.download_button(
             "Download Anomaly Report",
             anomalies.to_csv(index=False),
@@ -650,4 +922,5 @@ if st.button("Ask AI Analyst"):
         )
 
 else:
+
     st.info("Upload a CSV or Excel file to begin.")
