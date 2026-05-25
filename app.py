@@ -179,35 +179,136 @@ def detect_dataset_type(df):
         return "Financial Dataset"
 
     return "General Business Dataset"
-def clean_data(df):
-    semantic_mapping, detection_report = semantic_column_mapper(df)
+def universal_data_cleaning(df):
 
-    st.subheader("Detected Semantic Schema")
-    st.json(semantic_mapping)
+    cleaning_report = {}
 
-    with st.expander("View Schema Detection Confidence"):
-        st.dataframe(pd.DataFrame(detection_report))
+    cleaning_report["Original Rows"] = df.shape[0]
+    cleaning_report["Original Columns"] = df.shape[1]
 
-    df = df.rename(columns=semantic_mapping)
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
+    # Remove fully empty rows
+    df = df.dropna(how="all")
+
+    # Remove fully empty columns only
+    df = df.dropna(axis=1, how="all")
+
+    # Handle unnamed/blank columns intelligently
+    new_columns = []
+
+    unnamed_counter = 1
+
+    for col in df.columns:
+
+        col_str = str(col).strip()
+
+        # If column name missing or unnamed
+        if (
+            col is None
+            or col_str == ""
+            or "unnamed" in col_str.lower()
+        ):
+
+            sample_values = df[col].dropna().astype(str)
+
+            # If column has meaningful data
+            if len(sample_values) > 0:
+
+                inferred_name = f"unknown_column_{unnamed_counter}"
+
+                unnamed_counter += 1
+
+                new_columns.append(inferred_name)
+
+            else:
+                # Truly useless column
+                new_columns.append(f"drop_column_{unnamed_counter}")
+                unnamed_counter += 1
+
+        else:
+            new_columns.append(col_str)
+
+    df.columns = new_columns
+
+    # Remove truly useless unnamed columns
+    drop_cols = [c for c in df.columns if "drop_column_" in c]
+
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    # Standardize column names
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+        .str.replace("-", "_")
+        .str.replace(r"[^a-zA-Z0-9_]", "", regex=True)
+    )
+
+    # Remove duplicate columns
     df = df.loc[:, ~df.columns.duplicated()]
+
+    # Remove duplicate rows
     df = df.drop_duplicates()
 
-    if "order_date" in df.columns:
-        df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce", dayfirst=True)
+    # Clean text columns
+    object_cols = df.select_dtypes(include="object").columns
 
-    if "sales" in df.columns:
-        df["sales"] = pd.to_numeric(df["sales"], errors="coerce")
-        df = df.dropna(subset=["sales"])
+    for col in object_cols:
 
-    if "order_date" in df.columns:
-        df["year"] = df["order_date"].dt.year
-        df["month"] = df["order_date"].dt.month
-        df["month_name"] = df["order_date"].dt.month_name()
-        df["quarter"] = df["order_date"].dt.quarter
+        df[col] = df[col].astype(str).str.strip()
 
-    return df
+        df[col] = df[col].replace(
+            ["nan", "None", "NULL", ""],
+            pd.NA
+        )
 
+    # Intelligent datetime conversion
+    for col in df.columns:
+
+        if "date" in col or "time" in col:
+
+            df[col] = pd.to_datetime(
+                df[col],
+                errors="coerce",
+                dayfirst=True
+            )
+
+    # Intelligent numeric conversion
+    for col in df.columns:
+
+        if df[col].dtype == "object":
+
+            cleaned_numeric = (
+                df[col]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("$", "", regex=False)
+                .str.replace("%", "", regex=False)
+            )
+
+            converted = pd.to_numeric(
+                cleaned_numeric,
+                errors="coerce"
+            )
+
+            if converted.notna().mean() > 0.70:
+                df[col] = converted
+
+    cleaning_report["Final Rows"] = df.shape[0]
+    cleaning_report["Final Columns"] = df.shape[1]
+
+    cleaning_report["Rows Removed"] = (
+        cleaning_report["Original Rows"]
+        - cleaning_report["Final Rows"]
+    )
+
+    cleaning_report["Columns Removed"] = (
+        cleaning_report["Original Columns"]
+        - cleaning_report["Final Columns"]
+    )
+
+    return df, cleaning_report
 st.title("AI-Powered Universal Business Intelligence Platform")
 
 st.write(
@@ -217,6 +318,7 @@ st.write(
 )
 
 uploaded_file = st.file_uploader("Upload your CSV or Excel file", type=["csv", "xlsx"])
+
 def run_ecommerce_behavior_engine(df):
 
     st.subheader("Ecommerce Behavior Analytics Engine")
@@ -292,7 +394,20 @@ if uploaded_file is not None:
     st.subheader("Detected Dataset Type")
     st.info(dataset_type)
 
-    df = clean_data(df)
+    df, cleaning_report = universal_data_cleaning(df)
+
+st.subheader("Data Cleaning Summary")
+st.json(cleaning_report)
+
+semantic_mapping, detection_report = semantic_column_mapper(df)
+
+st.subheader("Detected Semantic Schema")
+st.json(semantic_mapping)
+
+with st.expander("View Schema Detection Confidence"):
+    st.dataframe(pd.DataFrame(detection_report))
+
+df = df.rename(columns=semantic_mapping)
 
     if dataset_type == "Ecommerce Interaction Dataset":
         st.success("File uploaded, cleaned, and processed successfully.")
